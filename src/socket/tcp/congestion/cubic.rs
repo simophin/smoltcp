@@ -228,6 +228,13 @@ impl Controller for Cubic {
         }
     }
 
+    fn on_sack_loss(&mut self, now: Instant, in_flight: usize) {
+        self.on_loss(now, in_flight);
+        // RFC 6675 section 5, step 4: SetPipe replaces all duplicate-ACK
+        // inflation, including the three MSS normally added on entry.
+        self.cwnd = self.ssthresh.min(self.rwnd);
+    }
+
     fn on_rto(&mut self, _now: Instant, in_flight: usize) {
         // RFC 5681: when the retransmission timer fires for a segment that has
         // already been retransmitted by the timer (no new data was ACKed since

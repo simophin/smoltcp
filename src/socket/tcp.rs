@@ -2886,9 +2886,15 @@ impl<'a> Socket<'a> {
                 // Inform the congestion controller that we're doing a fast retransmit and should enter the fast recovery state
                 let in_flight = self.flight_size();
                 self.recover.get_or_insert(self.snd_max);
-                self.congestion_controller
-                    .inner_mut()
-                    .on_loss(cx.now(), in_flight);
+                if self.sack_in_use() {
+                    self.congestion_controller
+                        .inner_mut()
+                        .on_sack_loss(cx.now(), in_flight);
+                } else {
+                    self.congestion_controller
+                        .inner_mut()
+                        .on_loss(cx.now(), in_flight);
+                }
                 net_debug!(
                     "entering loss recovery: in_flight={} cwnd={} sack={}",
                     in_flight,
@@ -7970,24 +7976,18 @@ mod test {
         send!(s, time 12, sack_ack(base, 0, &[(5120, 6144), (3072, 4096), (1024, 2048)], 65535));
         // Third duplicate ACK: the first hole is retransmitted at once ...
         expect_segment(&mut s, 13, base + 1, 1024);
-        assert_eq!(
-            s.congestion_controller.inner().window(),
-            ssthresh + 3 * 1024
-        );
-        // ... and the other holes follow in the same round trip (NextSeg rule 3),
-        // skipping the SACKed segments in between, until cwnd - pipe is exhausted.
-        expect_segment(&mut s, 13, base + 1 + 2048, 1024);
-        expect_segment(&mut s, 13, base + 1 + 4096, 1024);
+        // Unlike NewReno, SACK recovery does not add three MSS on entry:
+        // pipe still counts the later segments whose SACKs have not arrived.
+        assert_eq!(s.congestion_controller.inner().window(), ssthresh);
         recv_nothing!(s, time 13);
-        // Further SACKs for in-flight data cause no retransmission and do not
-        // inflate the congestion window.
+        // More SACKs lower pipe, making room for both remaining holes before
+        // the first repair is ACKed. They do not inflate cwnd.
         send!(s, time 14, sack_ack(base, 0, &[(5120, 7168), (3072, 4096), (1024, 2048)], 65535));
         send!(s, time 15, sack_ack(base, 0, &[(5120, 8192), (3072, 4096), (1024, 2048)], 65535));
+        expect_segment(&mut s, 15, base + 1 + 2048, 1024);
+        expect_segment(&mut s, 15, base + 1 + 4096, 1024);
         recv_nothing!(s, time 15);
-        assert_eq!(
-            s.congestion_controller.inner().window(),
-            ssthresh + 3 * 1024
-        );
+        assert_eq!(s.congestion_controller.inner().window(), ssthresh);
         // Partial ACKs: repaired holes are already in flight, nothing is resent.
         send!(s, time 40, sack_ack(base, 2048, &[(5120, 8192), (3072, 4096)], 65535));
         recv_nothing!(s, time 40);
@@ -8130,10 +8130,10 @@ mod test {
             Some(base + 1 + island(sack::MAX_RANGES - 1).1)
         );
         // Fast retransmit of the first hole, then lost holes in order while
-        // cwnd - pipe allows: ssthresh 51200 + 3 MSS, pipe 39936 after the
-        // first retransmission, so fourteen more holes fit.
+        // cwnd - pipe allows: cwnd = ssthresh = 51200, pipe 39936 after the
+        // first retransmission, so eleven more holes fit.
         expect_segment(&mut s, 11, base + 1, 1024);
-        for k in 1..=14 {
+        for k in 1..=11 {
             expect_segment(&mut s, 11, base + 1 + 2048 * k, 1024);
         }
         recv_nothing!(s, time 11);
@@ -8185,7 +8185,7 @@ mod test {
         // The first retransmission is unconditional; the others wait.
         expect_segment(&mut s, 13, base + 1, 1024);
         recv_nothing!(s, time 13);
-        send!(s, time 14, sack_ack(base, 0, &[(5120, 6144), (3072, 4096), (1024, 2048)], 65535));
+        send!(s, time 14, sack_ack(base, 0, &[(5120, 8192), (3072, 4096), (1024, 2048)], 65535));
         expect_segment(&mut s, 15, base + 1 + 2048, 1024);
         expect_segment(&mut s, 15, base + 1 + 4096, 1024);
         recv_nothing!(s, time 15);
