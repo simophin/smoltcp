@@ -548,6 +548,8 @@ pub struct Socket<'a> {
     local_rx_dup_acks: u8,
     /// If a fast retransmit needs to occur
     pending_fast_retransmit: bool,
+    /// Highest sequence sent when this fast-recovery episode began (RFC 6582).
+    recover: Option<TcpSeqNumber>,
 
     /// Duration for Delayed ACK. If None no ACKs will be delayed.
     ack_delay: Option<Duration>,
@@ -639,6 +641,7 @@ impl<'a> Socket<'a> {
             local_rx_last_seq: None,
             local_rx_dup_acks: 0,
             pending_fast_retransmit: false,
+            recover: None,
             ack_delay: Some(ACK_DELAY_DEFAULT),
             ack_delay_timer: AckDelayTimer::Idle,
             challenge_ack_timer: Instant::from_secs(0),
@@ -996,6 +999,8 @@ impl<'a> Socket<'a> {
         self.remote_last_seq = TcpSeqNumber::default();
         self.remote_last_ack = None;
         self.remote_last_win = 0;
+        self.pending_fast_retransmit = false;
+        self.recover = None;
         self.remote_win_len = 0;
         self.remote_win_scale = None;
         self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
@@ -2193,7 +2198,7 @@ impl<'a> Socket<'a> {
                         }
                     );
 
-                    if self.local_rx_dup_acks == 3 {
+                    if self.local_rx_dup_acks == 3 && self.recover.is_none() {
                         self.timer.set_for_fast_retransmit();
                         net_debug!("started fast retransmit");
                     }
@@ -2219,12 +2224,27 @@ impl<'a> Socket<'a> {
                     // Notify of fresh ACK
                     self.rtte.on_ack(cx.now(), ack_number);
                     let new_flight_size = self.flight_size().saturating_sub(ack_len);
-                    self.congestion_controller.inner_mut().on_ack(
-                        cx.now(),
-                        ack_len,
-                        new_flight_size,
-                        &self.rtte,
-                    );
+                    if ack_len > 0 && self.recover.is_some_and(|recover| ack_number < recover) {
+                        // RFC 6582 section 3: repair the next hole immediately and stay in
+                        // recovery until the whole flight present at entry is acknowledged.
+                        self.pending_fast_retransmit = true;
+                        self.congestion_controller.inner_mut().on_partial_ack(
+                            cx.now(),
+                            ack_len,
+                            new_flight_size,
+                        );
+                    } else {
+                        if self.recover.is_some_and(|recover| ack_number >= recover) {
+                            self.recover = None;
+                            self.pending_fast_retransmit = false;
+                        }
+                        self.congestion_controller.inner_mut().on_ack(
+                            cx.now(),
+                            ack_len,
+                            new_flight_size,
+                            &self.rtte,
+                        );
+                    }
                 }
             };
 
@@ -2565,6 +2585,8 @@ impl<'a> Socket<'a> {
                 // had sent them. This will cause all data in the queue
                 // to be sent again.
                 self.remote_last_seq = self.local_seq_no;
+                self.recover = None;
+                self.pending_fast_retransmit = false;
 
                 // Inform RTTE, so that it can can handle RTO backoff
                 self.rtte.on_rto();
@@ -2574,6 +2596,7 @@ impl<'a> Socket<'a> {
 
                 // Inform the congestion controller that we're doing a fast retransmit and should enter the fast recovery state
                 let in_flight = self.flight_size();
+                self.recover.get_or_insert(self.remote_last_seq);
                 self.congestion_controller
                     .inner_mut()
                     .on_loss(cx.now(), in_flight);
@@ -7017,6 +7040,79 @@ mod test {
             payload:    &b"ABCDEF"[..],
             ..RECV_TEMPL
         }));
+    }
+
+    #[cfg(any(feature = "socket-tcp-reno", feature = "socket-tcp-cubic"))]
+    fn check_newreno_partial_acks(controller: CongestionControl, base: TcpSeqNumber) {
+        let mut s = socket_established_with_buffer_sizes(16384, 16384);
+        s.local_seq_no = base + 1;
+        s.remote_last_seq = base + 1;
+        s.remote_mss = 1024;
+        s.remote_win_len = 65535;
+        s.set_nagle_enabled(false);
+        // Fill a flight first; loss recovery must work independently of slow start.
+        s.set_congestion_control(CongestionControl::None);
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(base + 1),
+                window_len: 65535,
+                ..SEND_TEMPL
+            }
+        );
+        s.send_slice(&[0x5a; 8192]).unwrap();
+        for i in 0..8 {
+            recv(&mut s, Instant::ZERO, |packet| {
+                let packet = packet.unwrap();
+                assert_eq!(packet.seq_number, base + 1 + i * 1024);
+                assert_eq!(packet.payload.len(), 1024);
+            });
+        }
+        s.set_congestion_control(controller);
+        for _ in 0..3 {
+            send!(s, time 10, TcpRepr { seq_number: REMOTE_SEQ + 1, ack_number: Some(base + 1), window_len: 65535, ..SEND_TEMPL });
+        }
+        recv(&mut s, Instant::from_millis(11), |packet| {
+            assert_eq!(packet.unwrap().seq_number, base + 1);
+        });
+        let recovery_window = s.congestion_controller.inner().window();
+        // First partial ACK repairs the next hole without waiting for an RTO.
+        send!(s, time 12, TcpRepr { seq_number: REMOTE_SEQ + 1, ack_number: Some(base + 1 + 1024), window_len: 65535, ..SEND_TEMPL });
+        assert_eq!(s.congestion_controller.inner().window(), recovery_window);
+        recv(&mut s, Instant::from_millis(13), |packet| {
+            assert_eq!(packet.unwrap().seq_number, base + 1 + 1024);
+        });
+        // A cumulative ACK crossing two segments deflates by those bytes and adds one MSS.
+        send!(s, time 14, TcpRepr { seq_number: REMOTE_SEQ + 1, ack_number: Some(base + 1 + 3072), window_len: 65535, ..SEND_TEMPL });
+        assert_eq!(
+            s.congestion_controller.inner().window(),
+            recovery_window - 1024
+        );
+        recv(&mut s, Instant::from_millis(15), |packet| {
+            assert_eq!(packet.unwrap().seq_number, base + 1 + 3072);
+        });
+        // A full recovery ACK exits exactly once, deflating the three duplicate-ACK MSS.
+        send!(s, time 16, TcpRepr { seq_number: REMOTE_SEQ + 1, ack_number: Some(base + 1 + 8192), window_len: 65535, ..SEND_TEMPL });
+        assert_eq!(
+            s.congestion_controller.inner().window(),
+            recovery_window - 3 * 1024
+        );
+        recv_nothing!(s, time 17);
+    }
+
+    #[test]
+    #[cfg(feature = "socket-tcp-reno")]
+    fn test_newreno_partial_acks_reno() {
+        check_newreno_partial_acks(CongestionControl::Reno, LOCAL_SEQ);
+        check_newreno_partial_acks(CongestionControl::Reno, TcpSeqNumber(i32::MAX - 4096));
+    }
+
+    #[test]
+    #[cfg(feature = "socket-tcp-cubic")]
+    fn test_newreno_partial_acks_cubic() {
+        check_newreno_partial_acks(CongestionControl::Cubic, LOCAL_SEQ);
+        check_newreno_partial_acks(CongestionControl::Cubic, TcpSeqNumber(i32::MAX - 4096));
     }
 
     #[test]

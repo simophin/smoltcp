@@ -20,6 +20,10 @@ pub(super) trait Controller {
 
     fn on_ack(&mut self, now: Instant, len: usize, in_flight: usize, rtt: &RttEstimator) {}
 
+    /// New data below the fast-recovery boundary was acknowledged (RFC 6582).
+    /// Deflate the recovery window without leaving recovery or growing cwnd.
+    fn on_partial_ack(&mut self, now: Instant, len: usize, in_flight: usize) {}
+
     /// Fired on each duplicate ack received, after `on_loss` has been called.
     fn on_dup_ack(&mut self, now: Instant, len: usize, in_flight: usize) {}
 

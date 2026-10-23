@@ -67,6 +67,17 @@ impl Controller for Reno {
         self.cwnd = self.cwnd.saturating_add(inc).min(self.rwnd).max(self.mss);
     }
 
+    fn on_partial_ack(&mut self, _now: Instant, len: usize, _in_flight: usize) {
+        // RFC 6582 section 3, step 5: deflate by newly ACKed bytes; add back one
+        // SMSS when at least one full segment was acknowledged. Do not exit recovery.
+        self.in_rto_recovery = false;
+        self.cwnd = self.cwnd.saturating_sub(len);
+        if len >= self.mss {
+            self.cwnd = self.cwnd.saturating_add(self.mss);
+        }
+        self.cwnd = self.cwnd.max(self.mss);
+    }
+
     fn on_dup_ack(&mut self, _now: Instant, len: usize, _in_flight: usize) {
         if self.in_fast_recovery {
             self.cwnd = self.cwnd.saturating_add(len).min(self.rwnd).max(self.mss);
