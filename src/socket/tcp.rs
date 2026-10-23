@@ -6835,6 +6835,17 @@ mod test {
     }
 
     #[test]
+    fn test_sack_reset_preserves_configured_min_rto() {
+        let mut s = socket();
+        s.set_min_rto(Duration::from_millis(200));
+        s.listen(80).unwrap();
+        assert_eq!(s.min_rto(), Duration::from_millis(200));
+        s.close();
+        s.listen(80).unwrap();
+        assert_eq!(s.min_rto(), Duration::from_millis(200));
+    }
+
+    #[test]
     fn test_reset_clears_connection_state() {
         let mut s = socket_established();
         s.remote_has_sack = true;
