@@ -19,6 +19,38 @@ const BYTES: usize = 10 * 1024 * 1024;
 static CLOCK: Mutex<(Instant, char)> = Mutex::new((Instant::ZERO, ' '));
 
 #[test]
+#[cfg(feature = "socket-tcp-cubic")]
+fn netsim_cubic_recovery_under_loss() {
+    // Deterministic seeds and a 54 ms RTT, matching the gateway loss benchmark.
+    for loss in [0.0, 0.005, 0.01] {
+        let result = run_test_with_socket_config(
+            TestSpec {
+                flows: vec![FlowSpec {
+                    rtt: Box::new(|_| Duration::from_millis(54)),
+                    loss,
+                    bytes: 1_000_000,
+                    seed_a_to_b: 123,
+                    seed_b_to_a: 456,
+                }],
+                buffer: 256 * 1024,
+                bandwidth: 25_000_000,
+                capacity: 256 * 1024,
+            },
+            |socket| {
+                socket.set_congestion_control(tcp::CongestionControl::Cubic);
+                socket.set_min_rto(Duration::from_millis(200));
+                socket.set_nagle_enabled(false);
+            },
+        );
+        eprintln!("CUBIC loss={loss}: {:.0} bytes/s", result.throughput);
+        assert!(
+            result.throughput > 10_000.0,
+            "recovery stalled under {loss} loss"
+        );
+    }
+}
+
+#[test]
 fn netsim() {
     setup_logging();
 
@@ -196,6 +228,16 @@ struct Flow {
 }
 
 fn run_test(case: TestSpec) -> TestResult {
+    // Keep the original fixtures' no-controller baseline independent of enabled features.
+    run_test_with_socket_config(case, |socket| {
+        socket.set_congestion_control(tcp::CongestionControl::None)
+    })
+}
+
+fn run_test_with_socket_config(
+    case: TestSpec,
+    configure: impl Fn(&mut tcp::Socket<'_>),
+) -> TestResult {
     assert!(case.flows.len() < 256, "too many flows");
 
     let mut time = Instant::ZERO;
@@ -256,14 +298,16 @@ fn run_test(case: TestSpec) -> TestResult {
         let mut sockets_a = SocketSet::new(Vec::new());
         let mut sockets_b = SocketSet::new(Vec::new());
 
-        let socket_a = tcp::Socket::new(
+        let mut socket_a = tcp::Socket::new(
             tcp::SocketBuffer::new(vec![0; case.buffer]),
             tcp::SocketBuffer::new(vec![0; case.buffer]),
         );
-        let socket_b = tcp::Socket::new(
+        let mut socket_b = tcp::Socket::new(
             tcp::SocketBuffer::new(vec![0; case.buffer]),
             tcp::SocketBuffer::new(vec![0; case.buffer]),
         );
+        configure(&mut socket_a);
+        configure(&mut socket_b);
         let handle_a = sockets_a.add(socket_a);
         let handle_b = sockets_b.add(socket_b);
 
