@@ -153,7 +153,9 @@ impl Controller for Cubic {
                 ALPHA_CUBIC
             };
 
-            self.w_est += alpha * self.mss as f64 * segment as f64 / self.cwnd as f64;
+            // RFC 9438 section 4.3 counts all newly ACKed bytes, including
+            // multiple segments covered by delayed or cumulative ACKs.
+            self.w_est += alpha * self.mss as f64 * len as f64 / self.cwnd as f64;
             self.w_est
         };
 
@@ -380,6 +382,27 @@ mod test {
             ack(&mut cubic, MSS, Instant::from_millis(100_000 + i * 100));
         }
         assert_eq!(cubic.window(), cubic.rwnd);
+    }
+
+    #[test]
+    fn reno_friendly_growth_counts_all_bytes_in_a_delayed_ack() {
+        let mut cubic = Cubic::new();
+        cubic.set_mss(MSS);
+        cubic.cwnd = 16 * MSS;
+        cubic.ssthresh = cubic.cwnd;
+        cubic.w_est = cubic.cwnd as f64;
+        cubic.w_max = cubic.cwnd;
+        cubic.cwnd_prior = 32 * MSS;
+        cubic.recompute_k();
+        cubic.recovery_start = Some(Instant::from_millis(0));
+
+        let initial = cubic.cwnd;
+        // Two segments delivered, one delayed ACK: RFC 9438 section 4.3 uses
+        // segments_acked = 2, not the number of ACK packets received.
+        ack(&mut cubic, 2 * MSS, Instant::from_millis(10));
+        let expected =
+            initial as f64 + ALPHA_CUBIC * MSS as f64 * (2 * MSS) as f64 / initial as f64;
+        assert_eq!(cubic.cwnd, expected as usize);
     }
 
     #[test]
