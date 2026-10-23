@@ -520,6 +520,8 @@ pub struct Socket<'a> {
     /// The last sequence number sent.
     /// I.e. in an idle socket, local_seq_no+tx_buffer.len().
     remote_last_seq: TcpSeqNumber,
+    /// Send high-water mark, independent of the cursor rewound on RTO.
+    snd_max: TcpSeqNumber,
     /// The last acknowledgement number sent.
     /// I.e. in an idle socket, remote_seq_no+rx_buffer.len().
     remote_last_ack: Option<TcpSeqNumber>,
@@ -627,6 +629,7 @@ impl<'a> Socket<'a> {
             local_seq_no: TcpSeqNumber::default(),
             remote_seq_no: TcpSeqNumber::default(),
             remote_last_seq: TcpSeqNumber::default(),
+            snd_max: TcpSeqNumber::default(),
             remote_last_ack: None,
             remote_last_win: 0,
             remote_win_len: 0,
@@ -994,6 +997,7 @@ impl<'a> Socket<'a> {
         self.local_seq_no = TcpSeqNumber::default();
         self.remote_seq_no = TcpSeqNumber::default();
         self.remote_last_seq = TcpSeqNumber::default();
+        self.snd_max = TcpSeqNumber::default();
         self.remote_last_ack = None;
         self.remote_last_win = 0;
         self.remote_win_len = 0;
@@ -1140,6 +1144,7 @@ impl<'a> Socket<'a> {
         let seq = Self::random_seq_no(cx);
         self.local_seq_no = seq;
         self.remote_last_seq = seq;
+        self.snd_max = seq;
         Ok(())
     }
 
@@ -1559,7 +1564,7 @@ impl<'a> Socket<'a> {
         // [...] an empty acknowledgment segment containing the current send-sequence number
         // and an acknowledgment indicating the next sequence number expected
         // to be received.
-        reply_repr.seq_number = self.remote_last_seq;
+        reply_repr.seq_number = self.snd_max;
         reply_repr.ack_number = Some(self.remote_seq_no + self.rx_buffer.len());
         self.remote_last_ack = reply_repr.ack_number;
 
@@ -1815,7 +1820,11 @@ impl<'a> Socket<'a> {
                         }
                     }
                     (true, false) => {
-                        if window_start <= segment_start && segment_start < window_end {
+                        if window_start <= segment_start
+                            && (segment_start < window_end
+                                || (segment_start == window_end
+                                    && repr.control == TcpControl::None))
+                        {
                             true
                         } else {
                             net_debug!("zero-length segment not inside window, will send an ACK.");
@@ -1996,6 +2005,7 @@ impl<'a> Socket<'a> {
                 self.local_seq_no = Self::random_seq_no(cx);
                 self.remote_seq_no = repr.seq_number + 1;
                 self.remote_last_seq = self.local_seq_no;
+                self.snd_max = self.local_seq_no;
                 self.remote_has_sack = repr.sack_permitted;
                 self.remote_win_scale = repr.window_scale;
                 // Remote doesn't support window scaling, don't do it.
@@ -2044,6 +2054,7 @@ impl<'a> Socket<'a> {
 
                 self.remote_seq_no = repr.seq_number + 1;
                 self.remote_last_seq = self.local_seq_no + 1;
+                self.snd_max = self.remote_last_seq;
                 self.remote_last_ack = Some(repr.seq_number);
                 self.remote_has_sack = repr.sack_permitted;
                 self.remote_win_scale = repr.window_scale;
@@ -2231,6 +2242,7 @@ impl<'a> Socket<'a> {
             // We've processed everything in the incoming segment, so advance the local
             // sequence number past it.
             self.local_seq_no = ack_number;
+            self.snd_max = self.snd_max.max(ack_number);
 
             // During retransmission, if an earlier segment got lost but later was
             // successfully received, self.local_seq_no can move past self.remote_last_seq.
@@ -2822,6 +2834,13 @@ impl<'a> Socket<'a> {
             State::FinWait2 | State::TimeWait => {}
         }
 
+        // Pure ACKs must use SND.MAX, not the retransmission cursor. Otherwise
+        // simultaneous RTOs can make both peers reject each other's valid ACK fields
+        // before processing them (issue #1221).
+        if repr.payload.is_empty() && repr.control == TcpControl::None {
+            repr.seq_number = self.snd_max;
+        }
+
         // There might be more than one reason to send a packet. E.g. the keep-alive timer
         // has expired, and we also have data in transmit buffer. Since any packet that occupies
         // sequence space will elicit an ACK, we only need to send an explicit packet if we
@@ -2908,9 +2927,12 @@ impl<'a> Socket<'a> {
         // We've sent a packet successfully, so we can update the internal state now.
         // Use max() so a fast-retransmit segment (whose seq_number is local_seq_no, well
         // behind the current frontier) doesn't rewind the tracked "highest sent" sequence.
-        self.remote_last_seq = self
-            .remote_last_seq
-            .max(repr.seq_number + repr.segment_len());
+        if repr.segment_len() > 0 {
+            self.remote_last_seq = self
+                .remote_last_seq
+                .max(repr.seq_number + repr.segment_len());
+            self.snd_max = self.snd_max.max(self.remote_last_seq);
+        }
         self.remote_last_ack = repr.ack_number;
         self.remote_last_win = repr.window_len;
 
@@ -3287,6 +3309,7 @@ mod test {
         s.local_seq_no = LOCAL_SEQ;
         s.remote_seq_no = REMOTE_SEQ + 1;
         s.remote_last_seq = LOCAL_SEQ;
+        s.snd_max = s.remote_last_seq;
         s.remote_win_len = 256;
         s
     }
@@ -3301,6 +3324,7 @@ mod test {
         s.tuple = Some(TUPLE);
         s.local_seq_no = LOCAL_SEQ;
         s.remote_last_seq = LOCAL_SEQ;
+        s.snd_max = s.remote_last_seq;
         s
     }
 
@@ -3313,6 +3337,7 @@ mod test {
         s.state = State::Established;
         s.local_seq_no = LOCAL_SEQ + 1;
         s.remote_last_seq = LOCAL_SEQ + 1;
+        s.snd_max = s.remote_last_seq;
         s.remote_last_ack = Some(REMOTE_SEQ + 1);
         s.remote_last_win = s.scaled_window();
         s
@@ -3333,6 +3358,7 @@ mod test {
         s.state = State::FinWait2;
         s.local_seq_no = LOCAL_SEQ + 1 + 1;
         s.remote_last_seq = LOCAL_SEQ + 1 + 1;
+        s.snd_max = s.remote_last_seq;
         s
     }
 
@@ -3340,6 +3366,7 @@ mod test {
         let mut s = socket_fin_wait_1();
         s.state = State::Closing;
         s.remote_last_seq = LOCAL_SEQ + 1 + 1;
+        s.snd_max = s.remote_last_seq;
         s.remote_seq_no = REMOTE_SEQ + 1 + 1;
         s.timer = Timer::Retransmit {
             expires_at: Instant::from_millis_const(1000),
@@ -5078,6 +5105,7 @@ mod test {
         let local_seq_start = TcpSeqNumber(i32::MAX - 1);
         s.local_seq_no = local_seq_start + 1;
         s.remote_last_seq = local_seq_start + 1;
+        s.snd_max = s.remote_last_seq;
         s.send_slice(b"abc").unwrap();
         recv!(s, time 1000, Ok(TcpRepr {
             seq_number: local_seq_start + 1,
@@ -6063,7 +6091,8 @@ mod test {
         // Push one byte into the tx buffer to simulate data that preceded the FIN.
         let _ = s.tx_buffer.enqueue_slice(b"x");
         // Mark it as already sent (remote_last_seq is past the data byte and the FIN).
-        s.remote_last_seq = LOCAL_SEQ + 1 + 1 + 1; // data(1) + FIN(1)
+        s.remote_last_seq = LOCAL_SEQ + 1 + 1 + 1;
+        s.snd_max = s.remote_last_seq; // data(1) + FIN(1)
 
         // Remote ACKs just the data byte, not the FIN (partial ACK).
         // ack_number = local_seq_no + 1  =>  ack_len = 1, ack_of_fin = false.
@@ -7017,6 +7046,190 @@ mod test {
             payload:    &b"ABCDEF"[..],
             ..RECV_TEMPL
         }));
+    }
+
+    #[test]
+    #[cfg(feature = "socket-tcp-cubic")]
+    fn test_two_peers_recover_after_simultaneous_ack_loss() {
+        // Both fixtures represent their own side of the same connection. The packet adapter
+        // mirrors endpoint ports; sequence numbers, windows, data and ACKs pass unchanged.
+        let mut a = socket_established_with_buffer_sizes(32768, 32768);
+        let mut b = socket_established_with_buffer_sizes(32768, 32768);
+        for s in [&mut a, &mut b] {
+            s.remote_seq_no = LOCAL_SEQ + 1;
+            s.remote_last_ack = Some(LOCAL_SEQ + 1);
+            s.remote_last_win = 32768;
+            s.remote_win_len = 32768;
+            s.remote_mss = 1348;
+            s.set_congestion_control(CongestionControl::Cubic);
+            s.set_nagle_enabled(false);
+            s.set_ack_delay(None);
+            s.set_min_rto(Duration::from_millis(200));
+            s.send_slice(&[0x5a; 8192]).unwrap();
+        }
+        type Segment = (TcpRepr<'static>, Vec<u8>);
+        fn emit(s: &mut TestSocket, time: Instant) -> Option<Segment> {
+            s.cx.set_now(time);
+            let mut result = None;
+            s.socket
+                .dispatch(&mut s.cx, |_, _, (_, repr)| {
+                    result = Some((
+                        TcpRepr {
+                            payload: &[],
+                            ..repr
+                        },
+                        repr.payload.to_vec(),
+                    ));
+                    Ok::<_, ()>(())
+                })
+                .unwrap();
+            result
+        }
+        fn deliver(s: &mut TestSocket, time: Instant, packet: Segment) -> Option<Segment> {
+            let (repr, bytes) = packet;
+            let repr = TcpRepr {
+                src_port: REMOTE_PORT,
+                dst_port: LOCAL_PORT,
+                payload: &bytes,
+                ..repr
+            };
+            send(s, time, &repr).map(|reply| {
+                (
+                    TcpRepr {
+                        payload: &[],
+                        ..reply
+                    },
+                    reply.payload.to_vec(),
+                )
+            })
+        }
+        let mut a_to_b = std::collections::VecDeque::new();
+        let mut b_to_a = std::collections::VecDeque::new();
+        // Emit both initial flights before either sees the other's data.
+        while let Some(packet) = emit(&mut a, Instant::ZERO) {
+            a_to_b.push_back(packet);
+        }
+        while let Some(packet) = emit(&mut b, Instant::ZERO) {
+            b_to_a.push_back(packet);
+        }
+        while let Some(packet) = a_to_b.pop_front() {
+            let _ = deliver(&mut b, Instant::ZERO, packet);
+        }
+        while let Some(packet) = b_to_a.pop_front() {
+            let _ = deliver(&mut a, Instant::ZERO, packet);
+        }
+        // Lose both ACK flights, then restore lossless delivery for 20 simulated seconds.
+        while emit(&mut a, Instant::ZERO).is_some() {}
+        while emit(&mut b, Instant::ZERO).is_some() {}
+        let mut received_a = 0;
+        let mut received_b = 0;
+        for tick in 1..=20_000 {
+            let now = Instant::from_millis(tick);
+            for (s, received) in [(&mut a, &mut received_a), (&mut b, &mut received_b)] {
+                while s.can_recv() {
+                    *received += s.recv(|bytes| (bytes.len(), bytes.len())).unwrap();
+                }
+            }
+            if received_a == 8192 && received_b == 8192 {
+                return;
+            }
+            if let Some(packet) = emit(&mut a, now) {
+                a_to_b.push_back(packet);
+            }
+            if let Some(packet) = emit(&mut b, now) {
+                b_to_a.push_back(packet);
+            }
+            for _ in 0..64 {
+                let mut progress = false;
+                if let Some(packet) = a_to_b.pop_front() {
+                    if let Some(reply) = deliver(&mut b, now, packet) {
+                        b_to_a.push_back(reply);
+                    }
+                    progress = true;
+                }
+                if let Some(packet) = b_to_a.pop_front() {
+                    if let Some(reply) = deliver(&mut a, now, packet) {
+                        a_to_b.push_back(reply);
+                    }
+                    progress = true;
+                }
+                if !progress {
+                    break;
+                }
+            }
+        }
+        panic!(
+            "bidirectional transfer stalled after ACK loss: {received_a}/8192, {received_b}/8192"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "socket-tcp-cubic")]
+    fn test_pure_ack_preserves_rto_cursor() {
+        let mut s = socket_established_with_buffer_sizes(8192, 64);
+        s.set_congestion_control(CongestionControl::Cubic);
+        s.congestion_controller
+            .inner_mut()
+            .on_rto(Instant::ZERO, 8192);
+        s.send_slice(&[0; 8192]).unwrap();
+        // One MSS retransmitted after RTO, while SND.MAX still covers the original flight.
+        s.remote_last_seq = LOCAL_SEQ + 1 + 1024;
+        s.snd_max = LOCAL_SEQ + 1 + 8192;
+        s.remote_last_ack = Some(REMOTE_SEQ);
+        recv(&mut s, Instant::ZERO, |packet| {
+            let packet = packet.unwrap();
+            assert!(packet.payload.is_empty());
+            assert_eq!(packet.seq_number, LOCAL_SEQ + 1 + 8192);
+        });
+        assert_eq!(s.remote_last_seq, LOCAL_SEQ + 1 + 1024);
+        assert_eq!(s.snd_max, LOCAL_SEQ + 1 + 8192);
+    }
+
+    #[test]
+    fn test_receive_window_end_only_allows_pure_ack() {
+        for (offset, control, payload) in [
+            (64, TcpControl::None, &b"x"[..]),
+            (65, TcpControl::None, &b""[..]),
+            (64, TcpControl::Fin, &b""[..]),
+        ] {
+            let mut s = socket_established();
+            s.send_slice(b"data").unwrap();
+            recv(&mut s, Instant::ZERO, |_| {});
+            let _ = send(
+                &mut s,
+                Instant::from_millis(1),
+                &TcpRepr {
+                    seq_number: REMOTE_SEQ + 1 + offset,
+                    ack_number: Some(LOCAL_SEQ + 1 + 4),
+                    control,
+                    payload,
+                    ..SEND_TEMPL
+                },
+            );
+            assert_eq!(s.send_queue(), 4);
+        }
+    }
+
+    #[test]
+    fn test_pure_ack_at_receive_window_end_acknowledges_data() {
+        let mut s = socket_established();
+        s.send_slice(b"data").unwrap();
+        recv(&mut s, Instant::ZERO, |_| {});
+        // The peer filled exactly the last advertised window but earlier data was lost.
+        send(
+            &mut s,
+            Instant::from_millis(1),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 64,
+                ack_number: Some(LOCAL_SEQ + 1 + 4),
+                ..SEND_TEMPL
+            },
+        );
+        assert_eq!(
+            s.send_queue(),
+            0,
+            "a pure ACK at the right edge must not be discarded"
+        );
     }
 
     #[test]
