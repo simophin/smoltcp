@@ -22,17 +22,77 @@ static CLOCK: Mutex<(Instant, char)> = Mutex::new((Instant::ZERO, ' '));
 #[cfg(feature = "socket-tcp-cubic")]
 fn netsim_cubic_recovery_under_loss() {
     // Deterministic seeds and a 54 ms RTT, matching the gateway loss benchmark.
+    // Each case runs with SACK negotiated (RFC 6675 recovery) and without
+    // (NewReno), so the two recovery paths can be compared on the same losses.
     for loss in [0.0, 0.005, 0.01] {
+        for sack in [false, true] {
+            let result = run_test_with_socket_config(
+                TestSpec {
+                    flows: vec![FlowSpec {
+                        rtt: Box::new(|_| Duration::from_millis(54)),
+                        loss,
+                        bytes: 1_000_000,
+                        seed_a_to_b: 123,
+                        seed_b_to_a: 456,
+                    }],
+                    buffer: 256 * 1024,
+                    bandwidth: 25_000_000,
+                    capacity: 256 * 1024,
+                },
+                |socket| {
+                    socket.set_congestion_control(tcp::CongestionControl::Cubic);
+                    socket.set_min_rto(Duration::from_millis(200));
+                    socket.set_nagle_enabled(false);
+                    socket.set_sack_enabled(sack);
+                },
+            );
+            eprintln!(
+                "CUBIC loss={loss} sack={sack}: {:.0} bytes/s",
+                result.throughput
+            );
+            assert!(
+                result.throughput > 10_000.0,
+                "recovery stalled under {loss} loss (sack={sack})"
+            );
+        }
+    }
+}
+
+/// Manual exploration of the loss-recovery paths: `NETSIM_LOSS`, `NETSIM_BYTES`,
+/// `NETSIM_SEED`, `NETSIM_RTT_MS` and `NETSIM_BUFFER` select the case, and both
+/// recovery paths are reported.
+#[test]
+#[ignore]
+#[cfg(feature = "socket-tcp-cubic")]
+fn netsim_cubic_loss_exploration() {
+    setup_logging();
+    let env = |name: &str, default: f64| -> f64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    let loss = env("NETSIM_LOSS", 0.01);
+    let bytes = env("NETSIM_BYTES", 10_000_000.0) as usize;
+    let seed = env("NETSIM_SEED", 1.0) as u64;
+    let rtt = env("NETSIM_RTT_MS", 54.0) as u64;
+    let buffer = env("NETSIM_BUFFER", 262_144.0) as usize;
+    let modes: &[bool] = match std::env::var("NETSIM_SACK").as_deref() {
+        Ok("0") => &[false],
+        Ok("1") => &[true],
+        _ => &[false, true],
+    };
+    for &sack in modes {
         let result = run_test_with_socket_config(
             TestSpec {
                 flows: vec![FlowSpec {
-                    rtt: Box::new(|_| Duration::from_millis(54)),
+                    rtt: Box::new(move |_| Duration::from_millis(rtt)),
                     loss,
-                    bytes: 1_000_000,
-                    seed_a_to_b: 123,
-                    seed_b_to_a: 456,
+                    bytes,
+                    seed_a_to_b: seed,
+                    seed_b_to_a: seed + 1000,
                 }],
-                buffer: 256 * 1024,
+                buffer,
                 bandwidth: 25_000_000,
                 capacity: 256 * 1024,
             },
@@ -40,12 +100,12 @@ fn netsim_cubic_recovery_under_loss() {
                 socket.set_congestion_control(tcp::CongestionControl::Cubic);
                 socket.set_min_rto(Duration::from_millis(200));
                 socket.set_nagle_enabled(false);
+                socket.set_sack_enabled(sack);
             },
         );
-        eprintln!("CUBIC loss={loss}: {:.0} bytes/s", result.throughput);
-        assert!(
-            result.throughput > 10_000.0,
-            "recovery stalled under {loss} loss"
+        eprintln!(
+            "CUBIC loss={loss} bytes={bytes} seed={seed} rtt={rtt}ms buffer={buffer} sack={sack}: {:.0} bytes/s",
+            result.throughput
         );
     }
 }
